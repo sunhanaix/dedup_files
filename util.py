@@ -7,7 +7,7 @@ import subprocess
 import ctypes
 import ctypes as ct
 from ctypes import wintypes as w
-
+import multiprocessing
 
 app_path = os.path.dirname(os.path.abspath(sys.argv[0]))
 
@@ -46,7 +46,7 @@ def get_wechat_path():
             dirs.append(value)
         return dirs
     except Exception as e:
-        return []
+        return [os.getcwd()] #如果没获得到微信数据目录，那么返回当前程序所在目录，否则返回None，不太友好
 
 def get_fs_type_old(path): #给定一个path，获得这个path所在文件系统的类型
     system = platform.system()
@@ -129,6 +129,18 @@ def get_logger(log_file):
     logger.addHandler(log_ch)
     return logger
 
+
+def get_cpu_cores(): #获取cpu的核数，用于后面给允许几个线程算md5做参考
+    try:
+        # 使用os模块获取CPU核数
+        num_cores = os.cpu_count()
+        if num_cores is None:
+            # 如果os.cpu_count()返回None，使用multiprocessing模块获取CPU核数
+            num_cores = multiprocessing.cpu_count()
+        return num_cores
+    except Exception as e:
+        return 1  #如果异常的话，也要给个数字1
+
 def get_cfg(cfg_file): #读取配置文件，获得系统配置
     cfg={}
     if os.path.isfile(cfg_file):
@@ -138,7 +150,9 @@ def get_cfg(cfg_file): #读取配置文件，获得系统配置
         cfg['dirs']=get_wechat_path() #尝试获得微信的存储目录，作为要被扫描的目录
         cfg['cache_file'] = os.path.join(app_path,'cache.dat')  #cache文件存放位置，默认放在当前程序目录下，如果空间紧张，可以把它放别处
         cfg['md5_key_file']=os.path.join(app_path,'md5_key_files.dat')  #以md5为key的hash dict，文件存放路径
+        cfg['to_del_file'] = os.path.join(app_path, 'to_del_files.dat')  # 以md5为key的hash dict，但是存放的只是要清理的文件信息，存放路径
         cfg['ask_before_del']=True #批量删除前，先进行确认下
+        cfg['max_workers']=get_cpu_cores() #起多个线程计算md5
         open(cfg_file,'w',encoding='utf8').write(json.dumps(cfg,indent=2,ensure_ascii=True))
     return cfg
 
@@ -160,7 +174,17 @@ def remove_unprintable_chars(input_str): #把不能打印出来的字符删掉�
     filtered_str = ''.join(printable_chars)
     return filtered_str
 
+def cmp_files(file1,file2): #通过查看文件的inode number，比较两个文件，是否是同一个文件
+    file1_stat=os.stat(file1)
+    file2_stat = os.stat(file2)
+    if not file1_stat.st_size==file2_stat.st_size: #如果两个文件大小不等，直接判断不是一个文件
+        return False
+    if file1_stat.st_ino==file2_stat.st_ino: #如果前面大小想等，那么这里判断是不是inode number一样
+        return True
+    else:
+        return False
+
 if __name__=='__main__':
-    path=r's:\perl_wrk'
-    fs_type=get_fs_type(path)
-    print(fs_type)
+    file1=r"D:\\wechat2\\WeChat Files\\wxid_cpyn7pe119rs21\\Applet\\wx0bc2c17d023b213d\\usrmmkvstorage0\\wx0bc2c17d023b213d.crc"
+    file2=r"D:\\wechat2\\WeChat Files\\wxid_cpyn7pe119rs21\\Applet\\wxff2aab9aa679ef93\\usrmmkvstorage1\\wxff2aab9aa679ef93.crc"
+    print(cmp_files(file1,file2))

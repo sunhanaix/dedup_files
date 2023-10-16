@@ -3,6 +3,7 @@ import hashlib
 from collections import defaultdict
 import ast
 import util
+import concurrent.futures
 sys.stdout.reconfigure(encoding='utf-8')
 
 SUPPORT_HARD_LINK_FS=['ext2','ext2','ext4','xfs','zfs','ntfs'] #fat和exfat文件系统，都不支持硬链接
@@ -14,6 +15,7 @@ log_file = os.path.basename(sys.argv[0]).split('.')[0] + '.log'
 cfg_file=os.path.basename(sys.argv[0]).split('.')[0] + '.ini'
 
 md5_dict=defaultdict(list)
+ino_dict=defaultdict(list)
 md5_array=[]
 
 mylog=util.get_logger(log_file) #设置写入日志函数
@@ -32,8 +34,10 @@ for dir in cfg['dirs']:
         input("按回车键退出")
         sys.exit(-1)
 
-def write_cache_file(cache_data): #把所有的内存中的每个文件的md5的数据，按一条条格式，全部dump到cache_file里面去
-    with open(cfg['cache_file'], 'w', encoding='utf-8') as file:
+def write_cache_file(cache_data,fname=None): #把所有的内存中的每个文件的md5的数据，按一条条格式，全部dump到cache_file里面去
+    if not fname:
+        fname=cfg['cache_file']
+    with open(fname, 'w', encoding='utf-8') as file:
         for entry in cache_data:
             # 使用repr()将字典转换为字符串，并写入文件
             file.write(repr(entry) + '\n')
@@ -55,21 +59,28 @@ def read_cache_file(): #把cache中所有文件的md5的数值，全部读入到
             cache_data.append(data)
     return cache_data
 
-def convert_array_to_dict(input_array): #把md5的{'file_name':'md5_value'}数组，转换成基于每一个md5的hash dict中，dict的key为md5值
+def convert_array_to_dict(input_array): #把md5的{'file_path':file_path,'size':size,'md5':md5_value}数组，转换成基于每一个md5的hash dict中，dict的key为md5值
     result_dict =defaultdict(list)
     for item in input_array:
-        for filename, uuid in item.items():
-            if uuid not in result_dict:
-                result_dict[uuid] = [filename]
-            else:
-                result_dict[uuid].append(filename)
+        if item['md5'] not in result_dict:
+            result_dict[item['md5']] = [item]
+        else:
+            result_dict[item['md5']].append(item)
     return result_dict
 
-def convert_dict_to_array(input_dict): #把基于md5做hash key的dict，转换为md5的{'file_name':'md5_value'}数组
+def convert_array_to_ino_dict(input_array): #把md5的{'file_path':file_path,'size':size,'md5':md5_value}数组，转换成基于每一个ino的hash dict中，dict的key为ino值
+    result_dict =defaultdict(list)
+    for item in input_array:
+        if item['ino'] not in result_dict:
+            result_dict[item['ino']] = [item]
+        else:
+            result_dict[item['ino']].append(item)
+    return result_dict
+
+def convert_dict_to_array(input_dict): #把基于md5做hash key的dict，转换为md5的{'file_path':file_path,'size':size,'md5':md5_value}数组
     result = []
-    for uuid, filenames in input_dict.items():
-        for filename in filenames:
-            result.append({filename: uuid})
+    for uuid in input_dict:
+        result.append(input_dict[uuid])
     return result
 
 def find_record_by_file_path(file_path):
@@ -77,70 +88,130 @@ def find_record_by_file_path(file_path):
     #如果没缓存过，或者没变化，会返回None
     global md5_array
     for record in md5_array:
-        if file_path in record:
+        if file_path== record['file_path']:
             return True
     return None
 
-def get_md5_info(): #遍历所有指定目录，获取每一个文件名字，然后对每一个文件，进行md5计算，并记录到cache中
-    # 计算文件的MD5哈希值并保存到字典中
+def calculate_md5(file_path, md5_dict, ino_dict, md5_array):
+    # 计算单个文件的MD5哈希值，以及获得文件属性信息
+    try:
+        md5_value = util.md5_file(file_path)
+        size = os.stat(file_path).st_size
+        ino = os.stat(file_path).st_ino
+        item_record = {'file_path': file_path, 'size': size, 'md5': md5_value, 'ino': ino}
+        if ino in ino_dict:
+            return  # Skip hard links
+        md5_dict[md5_value].append(item_record)
+        ino_dict[ino].append(item_record)
+        md5_array.append(item_record)
+        append_record_to_cache(item_record)
+    except Exception as e:
+        mylog.error(f"Error calculating MD5 for {file_path}: {e}")
+
+
+def get_md5_info():
     # 用于存储文件MD5哈希值和路径的字典
-    global md5_array,md5_dict
-    i=0
-    for directory in cfg['dirs']:
-        mylog.info(f"遍历{directory}获得每一个文件中……")
-        for root, _, files in os.walk(directory):
-            for file in files:
-                file_path = os.path.join(root, file)
-                i+=1
-                ss_file_path=util.remove_unprintable_chars(file_path)
-                log_ss=f"{i=},{ss_file_path},"
-                if find_record_by_file_path(file_path):
-                    mylog.info(f"{log_ss} in cache,will pass")
-                    continue
-                mylog.info(f"{log_ss} not in cache,will calc md5 now")
-                md5_value=None
-                try:
-                    md5_value=util.md5_file(file_path)
-                    md5_dict[md5_value].append(file_path)
-                    md5_array.append({file_path:md5_value})
-                    append_record_to_cache({file_path:md5_value})
-                except Exception as e:
-                    mylog.error(f"try open file:{ss_file_path} failed,reason:{e}")
-                    mylog.info(f"{md5_value=},{md5_dict=},{md5_array=}")
-                    continue
-    open(cfg['md5_key_file'],'w',encoding='utf8').write(json.dumps(md5_dict,indent=2,ensure_ascii=False))
+    global md5_array, md5_dict, ino_dict
+    i = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=cfg['max_workers']) as executor:
+        for directory in cfg['dirs']:
+            mylog.info(f"遍历{directory}获得每一个文件中……")
+            for root, _, files in os.walk(directory):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    i += 1
+                    ss_file_path = util.remove_unprintable_chars(file_path)
+                    log_ss = f"{i=},{ss_file_path},"
+                    if find_record_by_file_path(file_path):
+                        mylog.info(f"{log_ss} in cache, will pass")
+                        continue
+                    mylog.info(f"{log_ss} not in cache, will calculate md5 now")
+                    executor.submit(calculate_md5, file_path, md5_dict, ino_dict, md5_array)
+
+    open(cfg['md5_key_file'], 'w', encoding='utf8').write(json.dumps(md5_dict, indent=2, ensure_ascii=False))
     return md5_dict
+
 
 #从cache文件中，载入已经算过的md5数据
 md5_array=read_cache_file()
 md5_dict = convert_array_to_dict(md5_array)
+ino_dict = convert_array_to_ino_dict(md5_array)
 
 #开始计算每一个文件的md5
+stime=time.time()
 md5_dict = get_md5_info()
-mylog.info("遍历所有目录完成，现在比对重复文件")
+etime=time.time()
+mylog.info(f"遍历所有目录完成，耗时{etime-stime}秒，现在比对重复文件")
+
+#统计当前有哪些文件有多份副本，如果删除它们，可以节约多少空间
+duplicate_records=[]
+save_size=0 #可以节约的空间
+to_del_md5_dict=defaultdict(list) #存储需要删除文件清单
+for md5_value in md5_dict:
+    records=md5_dict[md5_value]
+    src_file=records[0]['file_path'] #取第一个记录作为源
+    try:
+        src_ino=os.stat(src_file).st_ino  #由于有cache缓存里记录了这个文件，就会用最开始的inode number，即使后面删除文件，做了硬链接，也没有更新cache.dat和md5_key_files.dat，因此这里现获得一遍
+    except Exception as e:
+        mylog.warning(f"{src_file}这个文件可能没有了,现在跳过这个文件，reason:{e}")
+        continue
+    if len(records) > 1: #只有副本数量>1的，才是重复文件
+        for other_record in records[1:]:  #把副本的第一个记录去掉，剩下的几个记录，就都是可以节约空间的
+            cur_file=other_record['file_path']
+            try:
+                cur_ino=os.stat(cur_file).st_ino
+            except Exception as e:
+                mylog.warning(f"{cur_file}这个文件可能没有了,现在跳过这个文件，reason:{e}")
+                continue
+            if src_ino==cur_ino: #如果两个文件的inode number相同，认为是一个硬链接，那么跳过这个
+                continue
+            if md5_value in to_del_md5_dict:
+                to_del_md5_dict[md5_value].append(other_record)
+            else:
+                to_del_md5_dict[md5_value]=[records[0],other_record]
+            save_size+=other_record['size']
+
+cnt_to_del_couple_files=0
+cnt_to_del_files=0
+
+for md5_value in to_del_md5_dict:
+    cnt_to_del_couple_files+=1
+    cnt_to_del_files+=len(to_del_md5_dict[md5_value])
+
+if save_size==0:
+    mylog.info("当前没有重复副本需要优化，可优化空间为0字节")
+    input("按回车键退出")
+    sys.exit(0)
+
+open(cfg['to_del_file'],'w',encoding='utf8').write(json.dumps(to_del_md5_dict,indent=2,ensure_ascii=False))
 
 if cfg['ask_before_del']:
-    a=input("将要删除副本>1的文件，是否继续？(Y/N)")
+    a=input(f"共有{cnt_to_del_couple_files}文件组（共{cnt_to_del_files}个文件），预计可节约{save_size/1024/1024:0.2f}MB空间，是否继续？(Y/N)")
     if not a.lstrip().rstrip().lower()=='y':
         mylog.info("你没有选择Y，本程序将会退出，不进行删除副本操作")
         print()
         input("按回车键退出")
         sys.exit()
 
-
+cnt_real_del_files=0 #实际删除文件数量
+size_real_del_files=0 #实际删除掉的文件，释放的空间数量
 # 创建硬链接
-for md5_value, file_paths in md5_dict.items():
-    if len(file_paths) > 1:
+for md5_value in md5_dict:
+    records=md5_dict[md5_value]
+    if len(records) > 1:
         # 找到重复的文件，保留一个，删除其它的，然后创建硬链接
-        reference_file = file_paths[0]
-        for duplicate_file in file_paths[1:]:
+        reference_file = records[0]['file_path']
+        for other_record in records[1:]:
+            duplicate_file=other_record['file_path']
             try:
-                mylog.warn(f"deleting {duplicate_file}")
+                mylog.warning(f"deleting {duplicate_file}")
             except  Exception as e:
                 mylog.error(e)
                 continue
             try:
                 os.remove(duplicate_file)
+                cnt_real_del_files += 1
+                size_real_del_files += other_record['size']
             except Exception as e:
                 mylog.error(f"remove file failed,reason:{e}")
                 continue
@@ -154,5 +225,6 @@ for md5_value, file_paths in md5_dict.items():
             except Exception as e:
                 mylog.error(f"link file failed,reason:{e}")
                 continue
+mylog.info(f"共整理{cnt_real_del_files}个文件，释放了{size_real_del_files/1024/1024:0.2f}MB空间")
 print()
 input("按回车键退出")
