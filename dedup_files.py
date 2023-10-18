@@ -4,6 +4,7 @@ from collections import defaultdict
 import ast
 import util
 import concurrent.futures
+import threading
 sys.stdout.reconfigure(encoding='utf-8')
 
 SUPPORT_HARD_LINK_FS=['ext2','ext2','ext4','xfs','zfs','ntfs'] #fat和exfat文件系统，都不支持硬链接
@@ -21,6 +22,11 @@ md5_array=[]
 mylog=util.get_logger(log_file) #设置写入日志函数
 cfg=util.get_cfg(cfg_file) #从配置文件中读入配置，如果文件不存在，则创建一个
 mylog.info(json.dumps(cfg,indent=2,ensure_ascii=True))
+
+# 创建锁对象
+md5_lock = threading.Lock()
+ino_lock = threading.Lock()
+array_lock = threading.Lock()
 
 #检查配置的去重目录是否支持硬链接，如果不支持，进行警告提醒，并直接退出
 for dir in cfg['dirs']:
@@ -93,7 +99,6 @@ def find_record_by_file_path(file_path):
     return None
 
 def calculate_md5(file_path, md5_dict, ino_dict, md5_array):
-    # 计算单个文件的MD5哈希值，以及获得文件属性信息
     try:
         md5_value = util.md5_file(file_path)
         size = os.stat(file_path).st_size
@@ -101,10 +106,15 @@ def calculate_md5(file_path, md5_dict, ino_dict, md5_array):
         item_record = {'file_path': file_path, 'size': size, 'md5': md5_value, 'ino': ino}
         if ino in ino_dict:
             return  # Skip hard links
-        md5_dict[md5_value].append(item_record)
-        ino_dict[ino].append(item_record)
-        md5_array.append(item_record)
-        append_record_to_cache(item_record)
+        # 使用锁来确保对字典和数组的访问是线程安全的
+        with md5_lock:
+            md5_dict[md5_value].append(item_record)
+        with ino_lock:
+            ino_dict[ino].append(item_record)
+        with array_lock:
+            md5_array.append(item_record)
+        with array_lock:
+            append_record_to_cache(item_record)
     except Exception as e:
         mylog.error(f"Error calculating MD5 for {file_path}: {e}")
 
@@ -201,10 +211,12 @@ for md5_value in md5_dict:
     if len(records) > 1:
         # 找到重复的文件，保留一个，删除其它的，然后创建硬链接
         reference_file = records[0]['file_path']
+        ss_reference_file=util.remove_unprintable_chars(reference_file)
         for other_record in records[1:]:
             duplicate_file=other_record['file_path']
+            ss_duplicate_file = util.remove_unprintable_chars(duplicate_file)
             try:
-                mylog.warning(f"deleting {duplicate_file}")
+                mylog.warning(f"deleting {ss_duplicate_file}")
             except  Exception as e:
                 mylog.error(e)
                 continue
@@ -216,7 +228,7 @@ for md5_value in md5_dict:
                 mylog.error(f"remove file failed,reason:{e}")
                 continue
             try:
-                mylog.info(f"link from {reference_file} to {duplicate_file}")
+                mylog.info(f"link from {ss_reference_file} to {ss_duplicate_file}")
             except Exception as e:
                 mylog.error(e)
                 continue
